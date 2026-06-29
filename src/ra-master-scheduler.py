@@ -60,12 +60,12 @@ def generate_date_list(start_year, start_month, end_year, end_month):
 
 def plan_workdays_multiple_months(
     start_year, start_month, end_year, end_month,
-    disabled_days=None, forced_days=None, want_overtime=False
+    disabled_days=None, forced_days=None, want_overtime=False, workdays=10
 ):
     """
     Solves the scheduling problem across multiple consecutive months:
 
-    - Exactly 10 workdays per calendar month (in each month from start to end).
+    - Exactly 10 workdays (for Master's student) and 12 workdays (for PhD student) per calendar month (in each month from start to end).
     - A 'workday' has at least 7.75 hours (no explicit daily max).
     - No more than 28 hours in any rolling 7-day window (across month boundaries).
     - If want_overtime=True, maximize total hours; otherwise, minimize.
@@ -138,8 +138,8 @@ def plan_workdays_multiple_months(
     for (y, m) in all_ym:
         dates_in_month = [d for d in date_list if (d.year, d.month) == (y, m)]
         prob += (
-            pulp.lpSum([yes_no[d] for d in dates_in_month]) == 10,
-            f"Exactly10Days_{y}_{m}"
+            pulp.lpSum([yes_no[d] for d in dates_in_month]) == workdays,
+            f"Exactly{workdays}days_{y}_{m}"
         )
 
     # Constraint 2: If yes_no[d] = 1, then hours[d] >= 7.75.
@@ -459,13 +459,28 @@ def main():
     # Overtime?
     ot_pref = input("Maximize overtime? (y/n) [n]: ")
     want_overtime = (ot_pref.lower()=="y")
+    
+    # Number of workdays
+    wd_pref = input("Number of workdays per month (Master's: 10, PhD: 12) [default: 10]: ")
+    try:
+        workdays = int(wd_pref) if wd_pref.strip() else 10
+        if workdays == 10:
+            print("10 workdays selected (Master's student).")
+        elif workdays == 12:
+            print("12 workdays selected (PhD student).")
+        else:
+            print(f"{workdays} workdays selected (neither Master's nor PhD default).")
+    except ValueError:
+        workdays = 10
+        print("Invalid input. Using default: 10 workdays (Master's student).")
 
     # 1) Solve w/ no forced or disabled => initial
     schedule_init = plan_workdays_multiple_months(
         sy, sm, ey, em,
         disabled_days=set(),
         forced_days=set(),
-        want_overtime=want_overtime
+        want_overtime=want_overtime,
+        workdays=workdays
     )
     if not schedule_init:
         print("No valid schedule found even with no forced/disabled.")
@@ -501,7 +516,8 @@ def main():
             sy, sm, ey, em,
             disabled_days=disabled_days,
             forced_days=forced_days,
-            want_overtime=want_overtime
+            want_overtime=want_overtime,
+            workdays=workdays
         )
         if not schedule:
             print("No valid schedule with these constraints.")

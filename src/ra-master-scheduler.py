@@ -1,6 +1,8 @@
 import calendar
 import datetime
+import re
 import sys
+from pathlib import Path
 
 # Handle holidays package
 try:
@@ -17,7 +19,202 @@ except ImportError:
     print("This script requires 'pulp' (PuLP) for optimization.")
     print("Install it using: pip install pulp")
     sys.exit(1)
-    
+
+try:
+    import yaml
+except ImportError:
+    print("This script requires 'PyYAML' for persistent day constraints.")
+    print("Install it using: pip install PyYAML")
+    sys.exit(1)
+
+
+CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "constraints.yaml"
+CONSTRAINT_TYPES = (
+    "paid_disabled_days",
+    "unpaid_disabled_days",
+    "forced_days",
+)
+
+
+def _empty_day_constraints():
+    """Return a fresh constraint mapping with all supported day categories."""
+    return {constraint_type: set() for constraint_type in CONSTRAINT_TYPES}
+
+
+def _parse_yaml_constraint_date(value, context):
+    """Convert a YAML scalar to a date and reject timestamps or malformed values."""
+    if isinstance(value, datetime.datetime):
+        raise ValueError(f"{context} must be a date, not a timestamp")
+    if isinstance(value, datetime.date):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{context} must be an ISO date string")
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{context} contains invalid date {value!r}") from error
+
+
+def _normalise_constraint_mapping(mapping, context):
+    """Validate and normalise one YAML constraint mapping to sets of dates."""
+    if mapping is None:
+        mapping = {}
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{context} must be a mapping")
+
+    unknown = set(mapping) - set(CONSTRAINT_TYPES)
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"{context} contains unknown constraint types: {names}")
+
+    constraints = _empty_day_constraints()
+    for constraint_type in CONSTRAINT_TYPES:
+        values = mapping.get(constraint_type, [])
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            raise ValueError(f"{context}.{constraint_type} must be a list")
+        constraints[constraint_type] = {
+            _parse_yaml_constraint_date(value, f"{context}.{constraint_type}")
+            for value in values
+        }
+    return constraints
+
+
+def _serialise_constraint_mapping(constraints):
+    """Create deterministic YAML-safe lists from date constraint sets."""
+    return {
+        constraint_type: [
+            day.isoformat() for day in sorted(constraints.get(constraint_type, set()))
+        ]
+        for constraint_type in CONSTRAINT_TYPES
+    }
+
+
+def load_day_constraints(path=CONSTRAINTS_PATH):
+    """Load current day constraints and their append-only history from YAML."""
+    path = Path(path)
+    if not path.exists():
+        return _empty_day_constraints(), []
+
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(f"Could not read {path}: {error}") from error
+
+    if document is None:
+        document = {}
+    if not isinstance(document, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+    if document.get("version", 1) != 1:
+        raise ValueError(f"{path} uses an unsupported constraints version")
+
+    constraints = _normalise_constraint_mapping(
+        document.get("day_constraints"), "day_constraints"
+    )
+    history = document.get("history", [])
+    if not isinstance(history, list):
+        raise ValueError("history must be a list")
+
+    validated_history = []
+    for index, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            raise ValueError(f"history[{index}] must be a mapping")
+        recorded_at = entry.get("recorded_at")
+        if not isinstance(recorded_at, str) or not recorded_at.strip():
+            raise ValueError(f"history[{index}].recorded_at must be a string")
+        additions = _normalise_constraint_mapping(
+            entry.get("added"), f"history[{index}].added"
+        )
+        snapshot = _normalise_constraint_mapping(
+            entry.get("constraints"), f"history[{index}].constraints"
+        )
+        history_entry = {
+            "recorded_at": recorded_at,
+            "added": _serialise_constraint_mapping(additions),
+            "constraints": _serialise_constraint_mapping(snapshot),
+        }
+        if "removed" in entry:
+            removals = _normalise_constraint_mapping(
+                entry.get("removed"), f"history[{index}].removed"
+            )
+            history_entry["removed"] = _serialise_constraint_mapping(removals)
+        validated_history.append(history_entry)
+
+    conflicts = (
+        constraints["forced_days"]
+        & (
+            constraints["paid_disabled_days"]
+            | constraints["unpaid_disabled_days"]
+        )
+    )
+    if conflicts:
+        formatted = ", ".join(str(day) for day in sorted(conflicts))
+        raise ValueError(
+            f"Dates cannot be both forced and disabled in {path}: {formatted}"
+        )
+    return constraints, validated_history
+
+
+def save_day_constraints(
+    constraints,
+    additions=None,
+    path=CONSTRAINTS_PATH,
+    recorded_at=None,
+    removals=None,
+):
+    """Persist current constraints and append one accepted change to YAML history."""
+    if additions is None:
+        additions = _empty_day_constraints()
+    if removals is None:
+        removals = _empty_day_constraints()
+
+    path = Path(path)
+    normalised = _normalise_constraint_mapping(
+        _serialise_constraint_mapping(constraints), "day_constraints"
+    )
+    normalised_additions = _normalise_constraint_mapping(
+        _serialise_constraint_mapping(additions), "added"
+    )
+    normalised_removals = _normalise_constraint_mapping(
+        _serialise_constraint_mapping(removals), "removed"
+    )
+
+    _, history = load_day_constraints(path)
+    has_additions = any(normalised_additions[name] for name in CONSTRAINT_TYPES)
+    has_removals = any(normalised_removals[name] for name in CONSTRAINT_TYPES)
+    if has_additions or has_removals:
+        if recorded_at is None:
+            recorded_at = datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        entry = {
+            "recorded_at": recorded_at,
+            "added": _serialise_constraint_mapping(normalised_additions),
+            "constraints": _serialise_constraint_mapping(normalised),
+        }
+        if has_removals:
+            entry["removed"] = _serialise_constraint_mapping(normalised_removals)
+        history.append(entry)
+
+    document = {
+        "version": 1,
+        "day_constraints": _serialise_constraint_mapping(normalised),
+        "history": history,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary_path.write_text(
+            yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    except OSError as error:
+        raise OSError(f"Could not write {path}: {error}") from error
+    return path
+
+
 def _last_day_of_month(year, month):
     """Return a date object representing the last day of the given year and month."""
     if month == 12:
@@ -28,7 +225,7 @@ def get_japanese_holidays_in_range(start_year, start_month, end_year, end_month)
     """
     Return a set of date objects for Japanese holidays within the specified month range.
     """
-       
+
     holiday_set = set()
     for y in range(start_year, end_year + 1):
         jp_holidays = holidays.Japan(years=[y])
@@ -36,12 +233,6 @@ def get_japanese_holidays_in_range(start_year, start_month, end_year, end_month)
             if (datetime.date(start_year, start_month, 1) <= day <= _last_day_of_month(end_year, end_month)):
                 holiday_set.add(day)
     return holiday_set
-
-def _last_day_of_month(year, month):
-    """Return a date object of the last day of the given year/month."""
-    if month == 12:
-        return datetime.date(year, 12, 31)
-    return datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
 
 def generate_date_list(start_year, start_month, end_year, end_month):
     """
@@ -60,16 +251,20 @@ def generate_date_list(start_year, start_month, end_year, end_month):
 
 def plan_workdays_multiple_months(
     start_year, start_month, end_year, end_month,
-    disabled_days=None, forced_days=None, want_overtime=False, workdays=10
+    disabled_days=None, forced_days=None, want_overtime=False, workdays=10,
+    paid_disabled_days=None, unpaid_disabled_days=None
 ):
     """
     Solves the scheduling problem across multiple consecutive months:
 
-    - Exactly 10 workdays (for Master's student) and 12 workdays (for PhD student) per calendar month (in each month from start to end).
-    - A 'workday' has at least 7.75 hours (no explicit daily max).
+    - Total workdays plus paid disabled days per calendar month equals the monthly limit
+      (10 for Master's student, 12 for PhD student by default).
+    - A 'workday' has at least 7.75 hours (no explicit daily max, capped at 14).
     - No more than 28 hours in any rolling 7-day window (across month boundaries).
     - If want_overtime=True, maximize total hours; otherwise, minimize.
     - 'forced_days': set of specific dates that MUST be workdays.
+    - 'paid_disabled_days': set of dates that are paid leave (non-working, but count towards monthly limit).
+    - 'unpaid_disabled_days': set of dates that are unpaid leave (non-working, do not count towards monthly limit).
 
     Returns a dict {date: assigned_hours, ...} for each date in the range,
     or an empty dict if no feasible solution is found.
@@ -78,6 +273,18 @@ def plan_workdays_multiple_months(
         disabled_days = set()
     else:
         disabled_days = set(disabled_days)
+
+    if paid_disabled_days is None:
+        paid_disabled_days = set()
+    else:
+        paid_disabled_days = set(paid_disabled_days)
+
+    if unpaid_disabled_days is None:
+        unpaid_disabled_days = set()
+    else:
+        unpaid_disabled_days = set(unpaid_disabled_days)
+
+    all_disabled_days = disabled_days | paid_disabled_days | unpaid_disabled_days
 
     if forced_days is None:
         forced_days = set()
@@ -102,7 +309,7 @@ def plan_workdays_multiple_months(
         feasible = not (
             d.weekday() >= 5 or  # Sat=5, Sun=6
             d in holiday_set or
-            d in disabled_days
+            d in all_disabled_days
         )
 
         var_name = d.isoformat()
@@ -116,7 +323,7 @@ def plan_workdays_multiple_months(
             yes_no_ub = 1
         else:
             yes_no_ub = 1 if feasible else 0
-        
+
         if not feasible:
             # Create a normal binary variable
             yes_no[d] = pulp.LpVariable(f"yes_no_{var_name}", cat=pulp.LpBinary)
@@ -125,7 +332,7 @@ def plan_workdays_multiple_months(
             prob += (yes_no[d] == 0, f"ForceZero_{d}")
         else:
             yes_no[d] = pulp.LpVariable(f"yes_no_{var_name}", cat=pulp.LpBinary, upBound=1)
-            
+
         # Modify the hours variable to explicitly cap daily hours
         hours[d] = pulp.LpVariable(
             f"hours_{var_name}",
@@ -133,12 +340,17 @@ def plan_workdays_multiple_months(
             upBound=14  # Maximum hours: 14
         )
 
-    # Constraint 1: Exactly 10 workdays per month
+    # Constraint 1: Exactly `workdays` days per month (counting paid disabled days)
     all_ym = sorted(list({(d.year, d.month) for d in date_list}))
     for (y, m) in all_ym:
         dates_in_month = [d for d in date_list if (d.year, d.month) == (y, m)]
+        paid_in_month = [
+            d for d in dates_in_month
+            if d in paid_disabled_days and d.weekday() < 5 and d not in holiday_set
+        ]
+        target_workdays = max(0, workdays - len(paid_in_month))
         prob += (
-            pulp.lpSum([yes_no[d] for d in dates_in_month]) == workdays,
+            pulp.lpSum([yes_no[d] for d in dates_in_month]) == target_workdays,
             f"Exactly{workdays}days_{y}_{m}"
         )
 
@@ -149,8 +361,13 @@ def plan_workdays_multiple_months(
         prob += (hours[d] <= 14, f"Max14HoursIfWorked_{d}")  # Enforce 14-hour max
         prob += (hours[d] <= 28 * yes_no[d], f"Zero_ifNotWorked_{d}")
 
-    # Constraint 2b: forced_days must be chosen (yes_no=1).
-    for fd in forced_days:
+    # Constraint 2b: forced_days within the planning range must be chosen.
+    dates_in_range = set(date_list)
+    out_of_range_forced = forced_days - dates_in_range
+    if out_of_range_forced:
+        formatted = ", ".join(str(d) for d in sorted(out_of_range_forced))
+        print(f"[!] Forced days outside the planning range were ignored: {formatted}")
+    for fd in forced_days & dates_in_range:
         prob += (yes_no[fd] == 1, f"ForcedDay_{fd}")
 
     # Constraint 3: No more than 28 hours in any rolling 7-day window
@@ -183,9 +400,6 @@ def plan_workdays_multiple_months(
         schedule[d] = round(val, 2)
 
     return schedule
-
-import calendar
-import datetime
 
 def parse_short_date_input(line: str) -> set:
     """
@@ -277,6 +491,151 @@ def safe_parse_short_date_input(prompt: str) -> set:
 
 
 
+def _parse_removal_indices(choice_str, max_len, entries):
+    """
+    Parse a user input string selecting entries to remove.
+    Supports formats like:
+      - 'x 1', 'x1', '1', '[1]', '[x] 1'
+      - '1, 2, 3', 'x 1, x 2', '1 2'
+      - '2026-12-25', 'x 2026-12-25'
+      - 'all', 'x all', '*'
+    """
+    cleaned = choice_str.strip().lower()
+    if not cleaned:
+        return set()
+    if cleaned in ("all", "x all", "xall", "*"):
+        return set(range(1, max_len + 1))
+    if cleaned == "x" and max_len == 1:
+        return {1}
+
+    raw_tokens = re.split(r"[,;\s]+", cleaned)
+    tokens = [t for t in raw_tokens if t]
+
+    indices = set()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("x", "[x]", "[ ]"):
+            if i + 1 < len(tokens):
+                tok = tokens[i + 1]
+                i += 1
+            else:
+                i += 1
+                continue
+
+        tok_clean = tok.lstrip("x[").rstrip("]")
+
+        if tok_clean.isdigit():
+            val = int(tok_clean)
+            if 1 <= val <= max_len:
+                indices.add(val)
+            else:
+                print(f"[!] Warning: Index {val} is out of range (1..{max_len}).")
+        else:
+            matched = False
+            for entry_idx, (day, cat, label) in enumerate(entries, 1):
+                if tok_clean == day.isoformat():
+                    indices.add(entry_idx)
+                    matched = True
+                    break
+            if not matched:
+                print(f"[!] Warning: Could not parse token '{tok}'.")
+        i += 1
+
+    return indices
+
+
+def prompt_remove_custom_entries(
+    paid_disabled_days,
+    unpaid_disabled_days,
+    forced_days,
+    path=CONSTRAINTS_PATH,
+):
+    """
+    Display a list of custom entries and allow the user to remove one or more by entering their index / marking with 'x'.
+    Saves the updated constraints to path and records removals in history.
+    Returns (paid_disabled_days, unpaid_disabled_days, forced_days, changed).
+    """
+    paid_disabled_days = set(paid_disabled_days)
+    unpaid_disabled_days = set(unpaid_disabled_days)
+    forced_days = set(forced_days)
+
+    removed_paid = set()
+    removed_unpaid = set()
+    removed_forced = set()
+
+    while True:
+        entries = []
+        for d in sorted(paid_disabled_days):
+            entries.append((d, "paid_disabled_days", "paid disabled day"))
+        for d in sorted(unpaid_disabled_days):
+            entries.append((d, "unpaid_disabled_days", "unpaid disabled day"))
+        for d in sorted(forced_days):
+            entries.append((d, "forced_days", "forced work day"))
+
+        entries.sort(key=lambda item: (item[0], item[1]))
+
+        if not entries:
+            if not (removed_paid or removed_unpaid or removed_forced):
+                print("No custom entries found to remove.")
+            else:
+                print("All custom entries have been removed.")
+            break
+
+        print("\nCustom entries:")
+        for idx, (day, cat, label) in enumerate(entries, 1):
+            print(f"  [ ] {idx}. {day} ({label})")
+
+        choice = input(
+            "\nEnter entry number(s) to remove (e.g. '1', 'x 1', '1, 3', 'all') [Enter when done]: "
+        ).strip()
+        if not choice:
+            break
+
+        selected_indices = _parse_removal_indices(choice, len(entries), entries)
+        if not selected_indices:
+            print("No valid entries selected.")
+            continue
+
+        for idx in sorted(selected_indices, reverse=True):
+            day, cat, label = entries[idx - 1]
+            print(f"Removed: [x] {day} ({label})")
+            if cat == "paid_disabled_days":
+                paid_disabled_days.remove(day)
+                removed_paid.add(day)
+            elif cat == "unpaid_disabled_days":
+                unpaid_disabled_days.remove(day)
+                removed_unpaid.add(day)
+            elif cat == "forced_days":
+                forced_days.remove(day)
+                removed_forced.add(day)
+
+    has_changed = bool(removed_paid or removed_unpaid or removed_forced)
+    if has_changed:
+        proposed_constraints = {
+            "paid_disabled_days": paid_disabled_days,
+            "unpaid_disabled_days": unpaid_disabled_days,
+            "forced_days": forced_days,
+        }
+        removals = {
+            "paid_disabled_days": removed_paid,
+            "unpaid_disabled_days": removed_unpaid,
+            "forced_days": removed_forced,
+        }
+        try:
+            save_day_constraints(
+                proposed_constraints,
+                additions=_empty_day_constraints(),
+                path=path,
+                removals=removals,
+            )
+            print(f"Saved updated constraints and removal history to {path}.")
+        except (OSError, ValueError) as error:
+            print(f"[!] Constraints were not applied because they could not be saved: {error}")
+
+    return paid_disabled_days, unpaid_disabled_days, forced_days, has_changed
+
+
 # The combined display function:
 
 def display_schedule(
@@ -284,7 +643,9 @@ def display_schedule(
     start_year, start_month,
     end_year, end_month,
     disabled_days=None,
-    forced_days=None
+    forced_days=None,
+    paid_disabled_days=None,
+    unpaid_disabled_days=None
 ):
     """
     Prints:
@@ -301,13 +662,19 @@ def display_schedule(
         disabled_days = set()
     if forced_days is None:
         forced_days = set()
+    if paid_disabled_days is None:
+        paid_disabled_days = set()
+    if unpaid_disabled_days is None:
+        unpaid_disabled_days = set()
+    disabled_days = set(disabled_days) | set(paid_disabled_days) | set(unpaid_disabled_days)
 
     holiday_set = get_japanese_holidays_in_range(start_year, start_month, end_year, end_month)
 
     # Colors
     COLOR_LIGHT_BLUISH_GREEN = "\033[38;5;86m"  # forced
     COLOR_LIGHT_RED          = "\033[91m"       # weekend & holiday
-    COLOR_MAGENTA            = "\033[38;5;207m" # forbidden
+    COLOR_MAGENTA            = "\033[38;5;207m" # forbidden / unpaid leave
+    COLOR_YELLOW             = "\033[93m"       # paid leave
     COLOR_GREEN              = "\033[92m"       # working
     COLOR_WHITE              = "\033[37m"       # free
     COLOR_RESET              = "\033[0m"
@@ -320,6 +687,10 @@ def display_schedule(
             return "weekend"
         if d in holiday_set:
             return "holiday"
+        if d in paid_disabled_days:
+            return "paid leave"
+        if d in unpaid_disabled_days:
+            return "unpaid leave"
         if d in disabled_days:
             return "forbidden"
         if hrs > 0:
@@ -333,7 +704,9 @@ def display_schedule(
             return COLOR_GREEN
         if day_type in ("weekend", "holiday"):
             return COLOR_LIGHT_RED
-        if day_type == "forbidden":
+        if day_type in ("paid leave", "paid disabled day"):
+            return COLOR_YELLOW
+        if day_type in ("forbidden", "unpaid leave"):
             return COLOR_MAGENTA
         return COLOR_WHITE
 
@@ -397,12 +770,13 @@ def display_schedule(
             weeks.append(cur)
         for w in weeks:
             print(" ".join(w))
-     
+
     legend = {
         "working": ( get_color("working"), "Working (Scheduled normal workdays)"),
         "weekend": ( get_color("weekend"), "Weekend (Saturdays and Sundays)"),
         "holiday": (get_color( "holiday"), "Holiday (National holidays)"),
-        "forbidden": ( get_color("forbidden"), "Forbidden (User-disabled days)"),
+        "paid leave": (get_color("paid leave"), "Paid disabled day"),
+        "unpaid leave": (get_color("unpaid leave"), "Unpaid disabled day"),
         "forced": (get_color("forced"), "Forced (User-mandated workdays)"),
         "free": ( get_color("free"), "Free (Non-working days)"),
     }
@@ -414,13 +788,138 @@ def display_schedule(
     print("\n=========================================\n")
 
 
+def _ical_escape(value):
+    """Escape text according to RFC 5545."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def _ical_fold(line, limit=75):
+    """Fold an iCalendar content line without splitting UTF-8 characters."""
+    chunks = []
+    current = ""
+    current_size = 0
+    for character in line:
+        size = len(character.encode("utf-8"))
+        if current and current_size + size > limit:
+            chunks.append(current)
+            current = " " + character
+            current_size = 1 + size
+        else:
+            current += character
+            current_size += size
+    chunks.append(current)
+    return "\r\n".join(chunks)
+
+
+def export_schedule_to_ical(
+    schedule,
+    output_path,
+    paid_disabled_days=None,
+    unpaid_disabled_days=None,
+    forced_days=None,
+    calendar_name="RA Master Schedule",
+):
+    """
+    Export scheduled work and explicitly entered constraints as all-day iCalendar events.
+
+    Returns the resulting Path. Explicit constraints outside the schedule range are omitted.
+    """
+    paid_disabled_days = set(paid_disabled_days or ())
+    unpaid_disabled_days = set(unpaid_disabled_days or ())
+    forced_days = set(forced_days or ())
+    schedule_dates = set(schedule)
+    output_path = Path(output_path).expanduser()
+    if output_path.suffix.lower() not in (".ics", ".ical"):
+        output_path = output_path.with_suffix(".ical")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//RA Master Scheduler//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        f"X-WR-CALNAME:{_ical_escape(calendar_name)}",
+    ]
+
+    event_dates = {
+        d for d, hours in schedule.items() if hours > 0
+    } | ((paid_disabled_days | unpaid_disabled_days | forced_days) & schedule_dates)
+
+    for day in sorted(event_dates):
+        hours = schedule.get(day, 0.0)
+        categories = []
+        if day in forced_days:
+            summary = "Forced work day"
+            categories.append("FORCED WORK")
+        elif day in paid_disabled_days:
+            summary = "Paid disabled day"
+            categories.append("PAID LEAVE")
+        elif day in unpaid_disabled_days:
+            summary = "Unpaid disabled day"
+            categories.append("UNPAID LEAVE")
+        else:
+            summary = "Scheduled work day"
+            categories.append("WORK")
+
+        description = f"Scheduled hours: {hours:.2f}" if hours > 0 else "No work scheduled"
+        uid = f"{day:%Y%m%d}-{categories[0].lower().replace(' ', '-') }@ra-master-scheduler"
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTART;VALUE=DATE:{day:%Y%m%d}",
+            f"DTEND;VALUE=DATE:{day + datetime.timedelta(days=1):%Y%m%d}",
+            f"SUMMARY:{_ical_escape(summary)}",
+            f"DESCRIPTION:{_ical_escape(description)}",
+            f"CATEGORIES:{','.join(categories)}",
+            "TRANSP:TRANSPARENT",
+            "END:VEVENT",
+        ])
+
+    lines.append("END:VCALENDAR")
+    content = "\r\n".join(_ical_fold(line) for line in lines) + "\r\n"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(content.encode("utf-8"))
+    return output_path
+
+
+def _dates_within_range(dates, start_date, end_date, label):
+    """Return in-range dates and report entries that cannot affect this schedule."""
+    dates = set(dates)
+    outside = dates - {d for d in dates if start_date <= d <= end_date}
+    if outside:
+        formatted = ", ".join(str(d) for d in sorted(outside))
+        print(f"[!] {label} outside the planning range ignored: {formatted}")
+    return {d for d in dates if start_date <= d <= end_date}
+
+
+def _prompt_for_export(schedule, paid_disabled_days, unpaid_disabled_days, forced_days):
+    answer = input("Export this schedule as iCalendar (.ical)? (y/n) [n]: ").strip().lower()
+    if answer != "y":
+        return
+    filename = input("Output filename [ra-master-schedule.ical]: ").strip()
+    filename = filename or "ra-master-schedule.ical"
+    try:
+        exported = export_schedule_to_ical(
+            schedule,
+            filename,
+            paid_disabled_days=paid_disabled_days,
+            unpaid_disabled_days=unpaid_disabled_days,
+            forced_days=forced_days,
+        )
+    except OSError as error:
+        print(f"[!] Could not export calendar: {error}")
+        return
+    print(f"Exported iCalendar file: {exported.resolve()}")
+
+
 def main():
-    """
-    1) Prompt for start date & duration
-    2) Solve w/ no forced/disabled -> show initial display
-    3) Repeatedly let user modify forced/disabled via short input
-    4) Re-solve & display.
-    """
+    """Prompt for a schedule, accumulate extra constraints, and optionally export it."""
     print("====== Multi-Month Workday Planner ======")
 
     today = datetime.date.today()
@@ -428,110 +927,212 @@ def main():
     default_start_year = next_month.year
     default_start_month = next_month.month
 
-    # Prompt start
     sy_str = input(f"Enter start year (e.g., {default_start_year}) [default: {default_start_year}]: ")
     sm_str = input(f"Enter start month (1-12) [default: {default_start_month}]: ")
-
     try:
         sy = int(sy_str) if sy_str.strip() else default_start_year
         sm = int(sm_str) if sm_str.strip() else default_start_month
+        _check_year_month(sy, sm)
     except ValueError:
         print("Invalid input. Using default start date.")
         sy, sm = default_start_year, default_start_month
 
-    # duration
     duration_str = input("Enter duration in months (e.g., 2) [default: 2]: ")
     try:
         duration = int(duration_str) if duration_str.strip() else 2
-        if duration<1:
+        if duration < 1:
             raise ValueError
     except ValueError:
-        duration=2
+        duration = 2
         print("Invalid. Using default: 2 months.")
 
-    # compute end
-    start_date = datetime.date(sy, sm, 1)
-    end_date = start_date + datetime.timedelta(days=31*(duration-1))
-    ey, em = end_date.year, end_date.month
+    end_month_index = sy * 12 + (sm - 1) + duration - 1
+    ey, em_zero_based = divmod(end_month_index, 12)
+    em = em_zero_based + 1
+    range_start = datetime.date(sy, sm, 1)
+    range_end = _last_day_of_month(ey, em)
 
     print(f"Planning schedule from {sy}-{sm:02d} to {ey}-{em:02d} ({duration} months).")
+    want_overtime = input("Maximise overtime? (y/n) [n]: ").strip().lower() == "y"
 
-    # Overtime?
-    ot_pref = input("Maximize overtime? (y/n) [n]: ")
-    want_overtime = (ot_pref.lower()=="y")
-    
-    # Number of workdays
     wd_pref = input("Number of workdays per month (Master's: 10, PhD: 12) [default: 10]: ")
     try:
         workdays = int(wd_pref) if wd_pref.strip() else 10
-        if workdays == 10:
-            print("10 workdays selected (Master's student).")
-        elif workdays == 12:
-            print("12 workdays selected (PhD student).")
-        else:
-            print(f"{workdays} workdays selected (neither Master's nor PhD default).")
+        if workdays < 1:
+            raise ValueError
     except ValueError:
         workdays = 10
         print("Invalid input. Using default: 10 workdays (Master's student).")
 
-    # 1) Solve w/ no forced or disabled => initial
-    schedule_init = plan_workdays_multiple_months(
+    try:
+        stored_constraints, constraint_history = load_day_constraints()
+    except ValueError as error:
+        print(f"[!] Invalid constraints file: {error}")
+        return
+
+    paid_disabled_days = stored_constraints["paid_disabled_days"]
+    unpaid_disabled_days = stored_constraints["unpaid_disabled_days"]
+    forced_days = stored_constraints["forced_days"]
+    disabled_days = paid_disabled_days | unpaid_disabled_days
+    current_schedule = plan_workdays_multiple_months(
         sy, sm, ey, em,
-        disabled_days=set(),
-        forced_days=set(),
+        disabled_days=disabled_days,
+        forced_days=forced_days,
         want_overtime=want_overtime,
-        workdays=workdays
+        workdays=workdays,
+        paid_disabled_days=paid_disabled_days,
+        unpaid_disabled_days=unpaid_disabled_days,
     )
-    if not schedule_init:
-        print("No valid schedule found even with no forced/disabled.")
-    else:
-        print("\n=== Initial schedule (no forced/disabled) ===")
-        display_schedule(schedule_init, sy, sm, ey, em,
-                        disabled_days=set(), forced_days=set())
+    if not current_schedule:
+        print("No valid schedule found with the constraints loaded from constraints.yaml.")
+        return
 
-    ans = input("Do you want to add forced or disabled working day constraints (y/n) [n]: ").strip()
-    if ans.lower() != "y":
-       print("Done. Exiting.")
-       exit(0)
-    # loop editing constraints
-    while True:
-        print("\nAdd/modify constraints (forced or disabled days).")
-        # parse short input for disabled
-        new_disabled = safe_parse_short_date_input("Enter disabled days (eg '2025-2-1,2,5,3-25'):\n> ")
+    print(
+        f"Loaded {sum(len(days) for days in stored_constraints.values())} day "
+        f"constraint(s) and {len(constraint_history)} history record(s) "
+        f"from {CONSTRAINTS_PATH}."
+    )
+    print("\n=== Initial schedule with persisted constraints ===")
+    display_schedule(
+        current_schedule, sy, sm, ey, em,
+        disabled_days=disabled_days,
+        forced_days=forced_days,
+        paid_disabled_days=paid_disabled_days,
+        unpaid_disabled_days=unpaid_disabled_days,
+    )
 
-        disabled_days = set()
-        forced_days = set()
-        # we add them
-        for nd in new_disabled:
-            disabled_days.add(nd)
-
-        # parse short input for forced
-        new_forced = safe_parse_short_date_input("Enter forced days (eg '2025-3-1,2,4-25,2025-5-2'):\n> ")
-
-        for nf in new_forced:
-            forced_days.add(nf)
-        
-        # re-solve
-        schedule = plan_workdays_multiple_months(
-            sy, sm, ey, em,
-            disabled_days=disabled_days,
-            forced_days=forced_days,
-            want_overtime=want_overtime,
-            workdays=workdays
+    if input(
+        "Do you want to remove custom entries? (y/n) [n]: "
+    ).strip().lower() in ("y", "yes"):
+        paid_disabled_days, unpaid_disabled_days, forced_days, changed = (
+            prompt_remove_custom_entries(
+                paid_disabled_days, unpaid_disabled_days, forced_days
+            )
         )
-        if not schedule:
-            print("No valid schedule with these constraints.")
-        else:
-            display_schedule(schedule, sy, sm, ey, em,
-                            disabled_days=disabled_days,
-                            forced_days=forced_days)
+        if changed:
+            disabled_days = paid_disabled_days | unpaid_disabled_days
+            updated_schedule = plan_workdays_multiple_months(
+                sy, sm, ey, em,
+                disabled_days=disabled_days,
+                forced_days=forced_days,
+                want_overtime=want_overtime,
+                workdays=workdays,
+                paid_disabled_days=paid_disabled_days,
+                unpaid_disabled_days=unpaid_disabled_days,
+            )
+            if updated_schedule:
+                current_schedule = updated_schedule
+                print("\n=== Updated schedule after removing constraints ===")
+                display_schedule(
+                    current_schedule, sy, sm, ey, em,
+                    disabled_days=disabled_days,
+                    forced_days=forced_days,
+                    paid_disabled_days=paid_disabled_days,
+                    unpaid_disabled_days=unpaid_disabled_days,
+                )
 
-        ans = input("Edit again? (y/n) [n]: ").strip()
-        if ans.lower() != "y":
-            print("Done. Exiting.")
-            break
+    while input(
+        "Add additional paid/unpaid disabled days or forced work days? (y/n) [n]: "
+    ).strip().lower() == "y":
+        print("\nEnter dates as YYYY-M-D,D,M-D (press Enter to add none).")
+        new_paid = safe_parse_short_date_input("Additional paid disabled days:\n> ")
+        new_unpaid = safe_parse_short_date_input("Additional unpaid disabled days:\n> ")
+        new_forced = safe_parse_short_date_input("Additional forced work days:\n> ")
 
-if __name__=="__main__":
+        new_paid = _dates_within_range(new_paid, range_start, range_end, "Paid disabled days")
+        new_unpaid = _dates_within_range(new_unpaid, range_start, range_end, "Unpaid disabled days")
+        new_forced = _dates_within_range(new_forced, range_start, range_end, "Forced work days")
+
+        proposed_paid = paid_disabled_days | new_paid
+        proposed_unpaid = unpaid_disabled_days | new_unpaid
+        proposed_forced = forced_days | new_forced
+        proposed_disabled = proposed_paid | proposed_unpaid
+        conflicts = proposed_disabled & proposed_forced
+        if conflicts:
+            formatted = ", ".join(str(d) for d in sorted(conflicts))
+            print(f"[!] Dates cannot be both disabled and forced; additions not applied: {formatted}")
+            continue
+
+        proposed_schedule = plan_workdays_multiple_months(
+            sy, sm, ey, em,
+            disabled_days=proposed_disabled,
+            forced_days=proposed_forced,
+            want_overtime=want_overtime,
+            workdays=workdays,
+            paid_disabled_days=proposed_paid,
+            unpaid_disabled_days=proposed_unpaid,
+        )
+        if not proposed_schedule:
+            print("No valid schedule with these additions; previous constraints retained.")
+            continue
+
+        accepted_additions = {
+            "paid_disabled_days": proposed_paid - paid_disabled_days,
+            "unpaid_disabled_days": proposed_unpaid - unpaid_disabled_days,
+            "forced_days": proposed_forced - forced_days,
+        }
+        proposed_constraints = {
+            "paid_disabled_days": proposed_paid,
+            "unpaid_disabled_days": proposed_unpaid,
+            "forced_days": proposed_forced,
+        }
+        try:
+            save_day_constraints(proposed_constraints, accepted_additions)
+        except (OSError, ValueError) as error:
+            print(f"[!] Constraints were not applied because they could not be saved: {error}")
+            continue
+
+        paid_disabled_days = proposed_paid
+        unpaid_disabled_days = proposed_unpaid
+        forced_days = proposed_forced
+        current_schedule = proposed_schedule
+        print(f"Saved constraints and history to {CONSTRAINTS_PATH}.")
+        display_schedule(
+            current_schedule, sy, sm, ey, em,
+            disabled_days=proposed_disabled,
+            forced_days=forced_days,
+            paid_disabled_days=paid_disabled_days,
+            unpaid_disabled_days=unpaid_disabled_days,
+        )
+
+        if input(
+            "Do you want to remove custom entries? (y/n) [n]: "
+        ).strip().lower() in ("y", "yes"):
+            paid_disabled_days, unpaid_disabled_days, forced_days, changed = (
+                prompt_remove_custom_entries(
+                    paid_disabled_days, unpaid_disabled_days, forced_days
+                )
+            )
+            if changed:
+                disabled_days = paid_disabled_days | unpaid_disabled_days
+                updated_schedule = plan_workdays_multiple_months(
+                    sy, sm, ey, em,
+                    disabled_days=disabled_days,
+                    forced_days=forced_days,
+                    want_overtime=want_overtime,
+                    workdays=workdays,
+                    paid_disabled_days=paid_disabled_days,
+                    unpaid_disabled_days=unpaid_disabled_days,
+                )
+                if updated_schedule:
+                    current_schedule = updated_schedule
+                    print("\n=== Updated schedule after removing constraints ===")
+                    display_schedule(
+                        current_schedule, sy, sm, ey, em,
+                        disabled_days=disabled_days,
+                        forced_days=forced_days,
+                        paid_disabled_days=paid_disabled_days,
+                        unpaid_disabled_days=unpaid_disabled_days,
+                    )
+
+    _prompt_for_export(
+        current_schedule,
+        paid_disabled_days,
+        unpaid_disabled_days,
+        forced_days,
+    )
+    print("Done. Exiting.")
+
+
+if __name__ == "__main__":
     main()
-
-

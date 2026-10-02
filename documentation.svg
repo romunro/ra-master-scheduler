@@ -58,6 +58,9 @@
         .color-box.forbidden {
             background-color: #E91E63; /* Magenta */
         }
+        .color-box.paid {
+            background-color: #FFEB3B; /* Yellow */
+        }
         .color-box.free {
             background-color: #FFFFFF; /* White */
         }
@@ -71,6 +74,7 @@
         .weekend { color: #FFCDD2; }
         .holiday { color: #EF9A9A; }
         .forbidden { color: #E91E63; }
+        .paid { color: #FFEB3B; }
         .free { color: #FFFFFF; }
         .blank { color: #666666; }
 
@@ -102,6 +106,8 @@
         The <strong>Multi-Month Workday Planner</strong> is a Python-based tool that generates optimal work schedules 
         across multiple months. It enforces several constraints, such as:
         <ul>
+            <li><strong>Monthly workday limit:</strong> Configurable monthly limit (default 10 for Master's, 12 for PhD).</li>
+            <li><strong>Paid disabled days:</strong> Count towards the monthly limit, reducing required scheduled workdays.</li>
             <li><strong>Limited weekly hours:</strong> No more than <code>28 hours</code> in any rolling <code>7-day</code> window.</li>
             <li><strong>Holidays &amp; weekends:</strong> Automatically excludes recognized holidays and weekends, unless forced.</li>
             <li><strong>Forced days:</strong> Some dates can be explicitly set as workdays.</li>
@@ -133,7 +139,8 @@
         <li><span class="color-box working"></span> <b>Working:</b> Scheduled normal workdays.</li>
         <li><span class="color-box weekend"></span> <b>Weekend:</b> Saturdays and Sundays (normally off unless forced).</li>
         <li><span class="color-box holiday"></span> <b>Holiday:</b> Recognized holidays (normally off unless forced).</li>
-        <li><span class="color-box forbidden"></span> <b>Forbidden:</b> User-disabled days (cannot be worked).</li>
+        <li><span class="color-box paid"></span> <b>Paid Leave:</b> Paid non-working / disabled days (yellow).</li>
+        <li><span class="color-box forbidden"></span> <b>Forbidden:</b> User-disabled days / unpaid leave (cannot be worked).</li>
         <li><span class="color-box free"></span> <b>Free:</b> Non-working days (the planner chose not to schedule work).</li>
     </ul>
 
@@ -311,12 +318,23 @@
     </div>
 
     <hr />
-    <h3>Adding Constraints</h3>
+    <h3>Managing Constraints (Adding &amp; Removing)</h3>
     <div class="output">
-        If you want, you can add/modify constraints (forced or disabled days).<br />
-        Enter disabled days (eg '2025-2-1,2,5,3-25'):<br />
+        Do you want to remove custom entries? (y/n) [n]: y<br />
+        <br />
+        Custom entries:<br />
+        &nbsp;&nbsp;[ ] 1. 2025-02-25 (unpaid disabled day)<br />
+        &nbsp;&nbsp;[ ] 2. 2025-02-26 (unpaid disabled day)<br />
+        <br />
+        Enter entry number(s) to remove (e.g. '1', 'x 1', '1, 3', 'all') [Enter when done]: x 1<br />
+        Removed: [x] 2025-02-25 (unpaid disabled day)<br />
+        <br />
+        Add additional paid/unpaid disabled days or forced work days? (y/n) [n]: y<br />
+        Additional paid disabled days:<br />
+        > <br />
+        Additional unpaid disabled days:<br />
         > 2025-2-25,26,3-25<br />
-        Enter forced days (eg '2025-3-1,2,2025-4-25'):<br />
+        Additional forced work days:<br />
         > 2025-2-4,5,3-31<br />
     </div>
 

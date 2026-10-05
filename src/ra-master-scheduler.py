@@ -27,7 +27,24 @@ except ImportError:
     print("Install it using: pip install PyYAML")
     sys.exit(1)
 
+try:
+    import requests
+    import icalendar
+except ImportError:
+    print("This script requires 'requests' and 'icalendar' for remote calendar reading.")
+    print("Install it using: pip install requests icalendar")
+    sys.exit(1)
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    print("This script requires Google API client libraries for syncing to Google Calendar.")
+    print("Install it using: pip install google-api-python-client google-auth")
+    sys.exit(1)
+
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 CONSTRAINTS_PATH = Path(__file__).resolve().parents[1] / "constraints.yaml"
 CONSTRAINT_TYPES = (
     "paid_disabled_days",
@@ -213,6 +230,29 @@ def save_day_constraints(
     except OSError as error:
         raise OSError(f"Could not write {path}: {error}") from error
     return path
+
+
+def load_config(path=CONFIG_PATH):
+    """Load configuration from config.yaml."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return config or {}
+    except (OSError, yaml.YAMLError) as error:
+        print(f"[!] Could not read config {path}: {error}")
+        return {}
+
+
+def save_config(config, path=CONFIG_PATH):
+    """Save configuration to config.yaml."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    except OSError as error:
+        print(f"[!] Could not write config {path}: {error}")
 
 
 def _last_day_of_month(year, month):
@@ -899,7 +939,7 @@ def _dates_within_range(dates, start_date, end_date, label):
 
 
 def _prompt_for_export(schedule, paid_disabled_days, unpaid_disabled_days, forced_days):
-    answer = input("Export this schedule as iCalendar (.ical)? (y/n) [n]: ").strip().lower()
+    answer = input("Export this schedule to a local .ical file? (y/n) [n]: ").strip().lower()
     if answer != "y":
         return
     filename = input("Output filename [ra-master-schedule.ical]: ").strip()
@@ -918,14 +958,245 @@ def _prompt_for_export(schedule, paid_disabled_days, unpaid_disabled_days, force
     print(f"Exported iCalendar file: {exported.resolve()}")
 
 
+def fetch_google_calendar_constraints(config, start_date, end_date):
+    """Fetch constraints directly from the synced Google Calendar."""
+    cal_id = config.get("calendar", {}).get("write_calendar_id")
+    key_path = config.get("calendar", {}).get("service_account_key_path", "service_account.json")
+    if not cal_id or not Path(key_path).exists():
+        return None, None, None
+
+    service = _get_google_calendar_service(key_path)
+    if not service:
+        return None, None, None
+
+    new_paid = set()
+    new_unpaid = set()
+    new_forced = set()
+
+    time_min = start_date.isoformat() + "T00:00:00Z"
+    time_max = (end_date + datetime.timedelta(days=1)).isoformat() + "T00:00:00Z"
+
+    try:
+        events_result = service.events().list(
+            calendarId=cal_id, timeMin=time_min, timeMax=time_max, singleEvents=True
+        ).execute()
+        events = events_result.get('items', [])
+        
+        for event in events:
+            summary = str(event.get('summary', '')).lower()
+            start = event.get('start', {})
+            dt = start.get('date') or start.get('dateTime')
+            if dt:
+                dt_obj = datetime.datetime.fromisoformat(dt.split('T')[0]).date()
+                if start_date <= dt_obj <= end_date:
+                    # Ignore the normal generated events
+                    if summary in ("scheduled work day", "no work scheduled"):
+                        continue
+                    if "forced" in summary:
+                        new_forced.add(dt_obj)
+                    elif "unpaid" in summary:
+                        new_unpaid.add(dt_obj)
+                    elif "paid" in summary:
+                        new_paid.add(dt_obj)
+                    else:
+                        new_unpaid.add(dt_obj)
+        return new_paid, new_unpaid, new_forced
+    except Exception as e:
+        print(f"[!] Failed to fetch constraints from Google Calendar: {e}")
+        return None, None, None
+
+
+def _get_google_calendar_service(key_path):
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            key_path,
+            scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        return build('calendar', 'v3', credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"[!] Failed to authenticate with Google Calendar: {e}")
+        return None
+
+
+def prompt_google_calendar_setup(config):
+    """Prompt user for target calendar if not set, optionally creating a new one."""
+    key_path = config.get("calendar", {}).get("service_account_key_path", "service_account.json")
+    if not Path(key_path).exists():
+        print(f"[!] Service account key not found at {key_path}. Cannot sync to Google Calendar.")
+        return None
+
+    service = _get_google_calendar_service(key_path)
+    if not service:
+        return None
+
+    try:
+        calendar_list = service.calendarList().list().execute().get('items', [])
+    except Exception as e:
+        print(f"[!] Failed to fetch calendar list: {e}")
+        return None
+
+    print("\nSelect a Target Google Calendar for syncing:")
+    for idx, cal in enumerate(calendar_list, 1):
+        print(f"[{idx}] {cal.get('summary')} (ID: {cal.get('id')})")
+    print(f"[{len(calendar_list) + 1}] Create a new empty calendar (Recommended)")
+
+    while True:
+        choice = input(f"Select an option (1-{len(calendar_list) + 1}) or press Enter to skip: ").strip()
+        if not choice:
+            return None
+        try:
+            choice_idx = int(choice)
+            if 1 <= choice_idx <= len(calendar_list):
+                selected_id = calendar_list[choice_idx - 1]['id']
+                return selected_id
+            elif choice_idx == len(calendar_list) + 1:
+                cal_name = input("Enter a name for the new calendar [RA Master Schedule]: ").strip() or "RA Master Schedule"
+                new_cal = {'summary': cal_name, 'timeZone': 'Asia/Tokyo'}
+                created_cal = service.calendars().insert(body=new_cal).execute()
+                new_id = created_cal['id']
+                print(f"Created new calendar: {cal_name}")
+                return new_id
+        except ValueError:
+            pass
+
+
+def sync_schedule_to_google_calendar(schedule, config, paid_disabled_days, unpaid_disabled_days, forced_days):
+    cal_id = config.get("calendar", {}).get("write_calendar_id")
+    if not cal_id:
+        cal_id = prompt_google_calendar_setup(config)
+        if not cal_id:
+            return
+        if "calendar" not in config:
+            config["calendar"] = {}
+        config["calendar"]["write_calendar_id"] = cal_id
+        save_config(config)
+
+    key_path = config.get("calendar", {}).get("service_account_key_path", "service_account.json")
+    service = _get_google_calendar_service(key_path)
+    if not service:
+        return
+
+    print(f"\nSyncing schedule to Google Calendar (ID: {cal_id})...")
+    try:
+        start_date = min(schedule.keys())
+        end_date = max(schedule.keys())
+        time_min = start_date.isoformat() + "T00:00:00Z"
+        time_max = (end_date + datetime.timedelta(days=1)).isoformat() + "T00:00:00Z"
+
+        events_result = service.events().list(
+            calendarId=cal_id, timeMin=time_min, timeMax=time_max, singleEvents=True
+        ).execute()
+        events = events_result.get('items', [])
+
+        def dummy_callback(request_id, response, exception):
+            if exception is not None:
+                pass
+
+        events_to_delete = []
+        for event in events:
+            summary = event.get('summary', '')
+            if summary in ("Scheduled work day", "No work scheduled", "Forced work day", "Paid disabled day", "Unpaid disabled day"):
+                events_to_delete.append(event['id'])
+
+        if events_to_delete:
+            print(f"Clearing {len(events_to_delete)} old generated events...")
+            for i in range(0, len(events_to_delete), 50):
+                batch = service.new_batch_http_request()
+                for event_id in events_to_delete[i:i+50]:
+                    batch.add(service.events().delete(calendarId=cal_id, eventId=event_id), callback=dummy_callback)
+                batch.execute()
+
+        events_to_insert = []
+        for day, hours in schedule.items():
+            if day in forced_days:
+                summary = "Forced work day"
+                description = f"Scheduled hours: {hours:.2f}"
+            elif day in paid_disabled_days:
+                summary = "Paid disabled day"
+                description = "Paid leave"
+            elif day in unpaid_disabled_days:
+                summary = "Unpaid disabled day"
+                description = "Unpaid leave"
+            elif hours > 0:
+                summary = "Scheduled work day"
+                description = f"Scheduled hours: {hours:.2f}"
+            else:
+                # Blank day, skip syncing to calendar
+                continue
+
+            event_body = {
+                'summary': summary,
+                'description': description,
+                'start': {'date': day.isoformat()},
+                'end': {'date': (day + datetime.timedelta(days=1)).isoformat()},
+            }
+            events_to_insert.append(event_body)
+
+        if events_to_insert:
+            print(f"Inserting {len(events_to_insert)} new events...")
+            for i in range(0, len(events_to_insert), 50):
+                batch = service.new_batch_http_request()
+                for event_body in events_to_insert[i:i+50]:
+                    batch.add(service.events().insert(calendarId=cal_id, body=event_body), callback=dummy_callback)
+                batch.execute()
+            
+        print(f"Successfully synced to Google Calendar!")
+        
+        share_ans = input("\nDo you want to add new sharing permissions (e.g. share with an additional email, or make public)? (y/n) [n]: ").strip().lower()
+        if share_ans == 'y':
+            while True:
+                user_email = input("Enter an additional email address to share this calendar with (or press Enter to skip/finish): ").strip()
+                if not user_email:
+                    break
+                rule = {
+                    'scope': {'type': 'user', 'value': user_email},
+                    'role': 'owner'
+                }
+                try:
+                    service.acl().insert(calendarId=cal_id, body=rule).execute()
+                    print(f"Shared calendar with {user_email}")
+                except HttpError as e:
+                    print(f"[!] Could not share with {user_email}: {e}")
+
+            make_public = input("Make this calendar public so you can sync it to Outlook via an iCal URL? (y/n) [n]: ").strip().lower()
+            if make_public == 'y':
+                rule = {
+                    'scope': {'type': 'default'},
+                    'role': 'reader'
+                }
+                try:
+                    service.acl().insert(calendarId=cal_id, body=rule).execute()
+                    print("Calendar is now public.")
+                except HttpError as e:
+                    print(f"[!] Could not make public: {e}")
+        
+        print("\n--- Calendar Links ---")
+        print(f"Web View URL: https://calendar.google.com/calendar/r?cid={cal_id}")
+        if not cal_id.endswith("@group.calendar.google.com") and "@" in cal_id:
+            # It's an email format, we can construct the iCal URL
+            # but usually service accounts create group calendars which end in @group.calendar.google.com
+            safe_id = cal_id.replace('@', '%40')
+        else:
+            safe_id = cal_id
+            
+        print(f"Public iCal URL (for Outlook sync, if calendar is public): https://calendar.google.com/calendar/ical/{safe_id}/public/basic.ics")
+        print("----------------------\n")
+    except HttpError as error:
+        print(f"[!] An error occurred syncing to Google Calendar: {error}")
+
+
 def main():
     """Prompt for a schedule, accumulate extra constraints, and optionally export it."""
     print("====== Multi-Month Workday Planner ======")
 
+    config = load_config()
+    defaults = config.get("defaults", {})
+
     today = datetime.date.today()
     next_month = today.replace(day=1) + datetime.timedelta(days=32)
-    default_start_year = next_month.year
-    default_start_month = next_month.month
+    
+    default_start_year = defaults.get("start_year", next_month.year)
+    default_start_month = defaults.get("start_month", next_month.month)
 
     sy_str = input(f"Enter start year (e.g., {default_start_year}) [default: {default_start_year}]: ")
     sm_str = input(f"Enter start month (1-12) [default: {default_start_month}]: ")
@@ -937,14 +1208,15 @@ def main():
         print("Invalid input. Using default start date.")
         sy, sm = default_start_year, default_start_month
 
-    duration_str = input("Enter duration in months (e.g., 2) [default: 2]: ")
+    default_duration = defaults.get("duration", 2)
+    duration_str = input(f"Enter duration in months (e.g., {default_duration}) [default: {default_duration}]: ")
     try:
-        duration = int(duration_str) if duration_str.strip() else 2
+        duration = int(duration_str) if duration_str.strip() else default_duration
         if duration < 1:
             raise ValueError
     except ValueError:
-        duration = 2
-        print("Invalid. Using default: 2 months.")
+        duration = default_duration
+        print(f"Invalid. Using default: {default_duration} months.")
 
     end_month_index = sy * 12 + (sm - 1) + duration - 1
     ey, em_zero_based = divmod(end_month_index, 12)
@@ -953,16 +1225,31 @@ def main():
     range_end = _last_day_of_month(ey, em)
 
     print(f"Planning schedule from {sy}-{sm:02d} to {ey}-{em:02d} ({duration} months).")
-    want_overtime = input("Maximise overtime? (y/n) [n]: ").strip().lower() == "y"
+    
+    default_overtime = defaults.get("want_overtime", False)
+    default_overtime_str = "y" if default_overtime else "n"
+    ot_pref = input(f"Maximise overtime? (y/n) [{default_overtime_str}]: ").strip().lower()
+    want_overtime = (ot_pref == "y") if ot_pref else default_overtime
 
-    wd_pref = input("Number of workdays per month (Master's: 10, PhD: 12) [default: 10]: ")
+    default_workdays = defaults.get("workdays", 10)
+    wd_pref = input(f"Number of workdays per month (Master's: 10, PhD: 12) [default: {default_workdays}]: ")
     try:
-        workdays = int(wd_pref) if wd_pref.strip() else 10
+        workdays = int(wd_pref) if wd_pref.strip() else default_workdays
         if workdays < 1:
             raise ValueError
     except ValueError:
-        workdays = 10
-        print("Invalid input. Using default: 10 workdays (Master's student).")
+        workdays = default_workdays
+        print(f"Invalid input. Using default: {default_workdays} workdays.")
+
+    # Save defaults
+    config["defaults"] = {
+        "start_year": sy,
+        "start_month": sm,
+        "duration": duration,
+        "want_overtime": want_overtime,
+        "workdays": workdays
+    }
+    save_config(config)
 
     try:
         stored_constraints, constraint_history = load_day_constraints()
@@ -973,6 +1260,71 @@ def main():
     paid_disabled_days = stored_constraints["paid_disabled_days"]
     unpaid_disabled_days = stored_constraints["unpaid_disabled_days"]
     forced_days = stored_constraints["forced_days"]
+
+    write_cal_id = config.get("calendar", {}).get("write_calendar_id")
+    if not write_cal_id:
+        print("\n[Google Calendar Setup]")
+        write_cal_id = prompt_google_calendar_setup(config)
+        if write_cal_id:
+            if "calendar" not in config:
+                config["calendar"] = {}
+            config["calendar"]["write_calendar_id"] = write_cal_id
+            save_config(config)
+
+    if write_cal_id:
+        ans = input(f"Update constraints from your Google Calendar? (y/n) [y]: ").strip().lower()
+        if ans != 'n':
+            print("Fetching calendar...")
+            new_paid, new_unpaid, new_forced = fetch_google_calendar_constraints(config, range_start, range_end)
+            if new_paid is not None:
+                added = {
+                    "paid_disabled_days": new_paid - stored_constraints["paid_disabled_days"],
+                    "unpaid_disabled_days": new_unpaid - stored_constraints["unpaid_disabled_days"],
+                    "forced_days": new_forced - stored_constraints["forced_days"],
+                }
+                
+                changes_found = False
+                for d in sorted(added["paid_disabled_days"]):
+                    print(f"[{d}] unconstrained -> forced paid day")
+                    changes_found = True
+                for d in sorted(added["unpaid_disabled_days"]):
+                    print(f"[{d}] unconstrained -> forced disabled")
+                    changes_found = True
+                for d in sorted(added["forced_days"]):
+                    print(f"[{d}] unconstrained -> forced working")
+                    changes_found = True
+
+                if changes_found:
+                    proceed = input("Do you want to apply these new constraints? (y/n) [y]: ").strip().lower()
+                    if proceed != 'n':
+                        paid_disabled_days |= new_paid
+                        unpaid_disabled_days |= new_unpaid
+                        forced_days |= new_forced
+                        
+                        # Check conflicts
+                        conflicts = (paid_disabled_days | unpaid_disabled_days) & forced_days
+                        if conflicts:
+                            formatted = ", ".join(str(d) for d in sorted(conflicts))
+                            print(f"[!] Dates cannot be both disabled and forced after sync: {formatted}")
+                            # Revert on conflict
+                            paid_disabled_days = stored_constraints["paid_disabled_days"]
+                            unpaid_disabled_days = stored_constraints["unpaid_disabled_days"]
+                            forced_days = stored_constraints["forced_days"]
+                        else:
+                            # Save the new constraints to YAML
+                            proposed_constraints = {
+                                "paid_disabled_days": paid_disabled_days,
+                                "unpaid_disabled_days": unpaid_disabled_days,
+                                "forced_days": forced_days,
+                            }
+                            try:
+                                save_day_constraints(proposed_constraints, additions=added)
+                                print("Calendar synced successfully and saved to constraints.")
+                            except Exception as e:
+                                print(f"[!] Could not save imported calendar constraints: {e}")
+                else:
+                    print("No new constraints found in the calendar.")
+
     disabled_days = paid_disabled_days | unpaid_disabled_days
     current_schedule = plan_workdays_multiple_months(
         sy, sm, ey, em,
@@ -1131,6 +1483,19 @@ def main():
         unpaid_disabled_days,
         forced_days,
     )
+    
+    # Prompt for Google Calendar Sync
+    if config.get("calendar", {}).get("service_account_key_path"):
+        ans = input("Sync this schedule directly to Google Calendar? (y/n) [n]: ").strip().lower()
+        if ans == "y":
+            sync_schedule_to_google_calendar(
+                current_schedule, 
+                config, 
+                paid_disabled_days, 
+                unpaid_disabled_days, 
+                forced_days
+            )
+            
     print("Done. Exiting.")
 
 

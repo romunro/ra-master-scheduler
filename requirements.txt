@@ -1,0 +1,7 @@
+holidays
+pulp
+PyYAML
+requests
+icalendar
+google-api-python-client
+google-auth

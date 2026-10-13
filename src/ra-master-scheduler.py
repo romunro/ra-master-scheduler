@@ -420,9 +420,18 @@ def plan_workdays_multiple_months(
             f"Max28h_7days_start_{d}"
         )
 
-    # Objective: sum of hours over entire range
-    total_hours = pulp.lpSum([hours[d] for d in date_list])
-    prob.setObjective(total_hours)
+    # Objective: sum of hours with a slight time-based weight to front-load schedule
+    start_date = min(date_list)
+    objective_terms = []
+    
+    for d in date_list:
+        day_index = (d - start_date).days
+        # If minimizing (default), making later days "more expensive" pushes work earlier.
+        # If maximizing (overtime), making later days "less rewarding" pushes work earlier.
+        weight = 1.0 + (day_index * 0.001) if not want_overtime else 1.0 - (day_index * 0.001)
+        objective_terms.append(hours[d] * weight)
+        
+    prob.setObjective(pulp.lpSum(objective_terms))
 
     # Solve
     status = prob.solve(pulp.PULP_CBC_CMD(msg=0))

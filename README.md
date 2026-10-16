@@ -43,4 +43,54 @@ It is highly recommended to create a dedicated, empty calendar for this schedule
 8. Change the permission to **"Make changes to events"**.
 9. Click **Send**.
 
-When you run the script, it will ask you if you want to sync, and it will let you select this calendar from a list.
+When you run the script, it will automatically load your settings, check your Google Calendar in the background, and display an uncluttered overview dashboard.
+
+## Running the Scheduler
+
+Run the scheduler with:
+```bash
+python3 src/ra-master-scheduler.py
+```
+
+### Features & CLI Interface
+
+- **Initial Setup vs. Instant Launch**:
+  - **First Run**: If no settings are configured yet, an interactive wizard prompts for your start year/month, duration, target workdays (Master's: 10, PhD: 12), and overtime preference.
+  - **Subsequent Runs**: Automatically loads your settings and saved constraints, checks Google Calendar in the background, renders the overview dashboard, and presents an interactive menu.
+
+- **Responsive Horizontal Month Stacking**:
+  - Months are automatically stacked side-by-side to fit your terminal width.
+  - Wraps to a new row only when an entire month cannot fit on the current row.
+  - Each month displays a compact progress line indicating worked days against monthly targets (e.g. `10/10d (77.5h)`).
+
+- **Interactive Calendar Day Editor (`[1]` in menu)**:
+  - Full-screen terminal UI (TUI) powered by `curses`.
+  - Use **Arrow Keys** (←, →, ↑, ↓) to navigate across days and weeks, or **PgUp / PgDn** (`[` / `]`) to jump month-by-month.
+  - **Shortcut Keys**:
+    - `[F]`: Toggle Forced Workday
+    - `[P]`: Toggle Paid Leave (Paid Disabled Day)
+    - `[U]`: Toggle Unpaid Leave (Unpaid Disabled Day)
+    - `[C]` / `[Delete]`: Clear constraint (revert to automatic)
+    - `[S]`: Solve schedule in memory immediately (without saving to disk)
+    - `[Q]` / `[Esc]`: Exit editor (prompts to save changes if modified)
+
+- **Lock Past Workdays (`[2]` in menu)**:
+  - Detects all previously planned workdays before today that have already passed.
+  - Converts them into forced workdays with one click so future optimization will never alter passed work history.
+
+- **Background Google Calendar Sync & Visual Comparison (`[3]` in menu)**:
+  - Non-intrusively checks remote Google Calendar events on startup.
+  - If external additions or changes are found, provides a formatted list of changes to review.
+  - Shows side-by-side **Before & After visual calendar comparison** for only the months affected by the changes, solving the schedule in advance and warning if the changes cause infeasibility.
+  - Push current schedules and export to public iCal URLs with ease.
+
+- **Detailed Day-by-Day Table (`[6]` in menu)**:
+  - View full day-by-day tables with 7-day rolling window hour sums on demand without cluttering the main dashboard.
+
+- **Standard Timing & Alerts (iCal & Google Calendar)**:
+  - Workdays and leave days are scheduled during normal working hours: **09:00 – 17:45** (`Asia/Tokyo`).
+  - Automatically configured with a popup/display alert **10 hours before starting** (at 23:00 the evening before).
+
+- **Paid Leave Accounting**:
+  - Paid leave days count towards your monthly total days worked target (e.g. 9 physical workdays + 1 paid leave = 10 target days).
+  - Each paid leave day accounts for **7.75 hours of work** in the schedule, monthly progress, rolling 7-day limits, and calendar exports.
